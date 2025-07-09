@@ -43,6 +43,7 @@ class PauliStringMeasurementResult:
         unmitigated_expectation: The unmitigated expectation value of the Pauli string.
         unmitigated_stddev: The standard deviation of the unmitigated expectation value.
         calibration_result: The calibration result for single-qubit readout errors.
+        raw_bitstrings: The raw bitstrings of the circuit measurement.
     """
 
     pauli_string: ops.PauliString
@@ -86,6 +87,36 @@ def _are_two_pauli_strings_qubit_wise_commuting(
         if not _commute_or_identity(op1, op2):
             return False
     return True
+
+
+def _are_pauli_sum_and_pauli_string_qubit_wise_commuting(
+    pauli_sum: ops.PauliSum,
+    pauli_str: ops.PauliString,
+    all_qubits: list[ops.Qid] | frozenset[ops.Qid],
+) -> bool:
+    """Checks if a Pauli sum and a Pauli string are Qubit-Wise Commuting."""
+    for pauli_sum_term in pauli_sum:
+        for qubit in all_qubits:
+            op1 = pauli_sum_term.get(qubit, default=ops.I)
+            op2 = pauli_str.get(qubit, default=ops.I)
+
+            if not _commute_or_identity(op1, op2):
+                return False
+    return True
+
+
+def _are_symmetry_and_pauli_string_qubit_wise_commuting(
+    symmetry: ops.PauliString | ops.PauliSum,
+    pauli_str: ops.PauliString,
+    all_qubits: list[ops.Qid] | frozenset[ops.Qid],
+) -> bool:
+    """Checks if a symmetry (Pauli string or Pauli sum) and a Pauli string are Qubit-Wise Commuting."""
+    if isinstance(symmetry, ops.PauliSum):
+        return _are_pauli_sum_and_pauli_string_qubit_wise_commuting(symmetry, pauli_str, all_qubits)
+    elif isinstance(symmetry, ops.PauliString):
+        return _are_two_pauli_strings_qubit_wise_commuting(symmetry, pauli_str, all_qubits)
+    else:
+        return False
 
 
 def _validate_group_paulis_qwc(
@@ -278,6 +309,42 @@ def _build_many_one_qubits_empty_confusion_matrix(qubits_length: int) -> list[np
     return [_build_one_qubit_confusion_matrix(0, 0) for _ in range(qubits_length)]
 
 
+def _postselection_bitstrings(
+    qubits: list[ops.Qid],
+    pauli_strings: list[ops.PauliString],
+    measurement_results: np.ndarray,
+    postselection_symmetries: dict[ops.PauliString | ops.PauliSum, int],
+) -> np.ndarray:
+    qwc_symmetries = {
+        sym: value
+        for sym, value in postselection_symmetries.items()
+        if all(
+            _are_symmetry_and_pauli_string_qubit_wise_commuting(sym, pauli_str, qubits)
+            for pauli_str in pauli_strings
+        )
+    }
+
+    if not qwc_symmetries:
+        return measurement_results
+
+    # Filter the bitstrings based on postselection symmetries
+    measurement_result_eigenvalues = 1 - 2 * measurement_results
+
+    rows_to_keep_mask = np.ones(len(measurement_result_eigenvalues), dtype=bool)
+
+    for sym, expected_value in qwc_symmetries.items():
+        qubit_indices = [q.x for q in sym.keys()]
+        actual_eigenvalues = np.prod(measurement_result_eigenvalues[:, qubit_indices], axis=1)
+        rows_to_keep_mask &= actual_eigenvalues == expected_value
+        print(expected_value)
+        print("here")
+        print(actual_eigenvalues)
+        # print(actual_eigenvalues == expected_value)
+    # print(rows_to_keep_mask)
+    # print(measurement_results[rows_to_keep_mask])
+    return measurement_results[rows_to_keep_mask]
+
+
 def _process_pauli_measurement_results(
     qubits: list[ops.Qid],
     pauli_string_groups: list[list[ops.PauliString]],
@@ -285,6 +352,7 @@ def _process_pauli_measurement_results(
     calibration_results: dict[tuple[ops.Qid, ...], SingleQubitReadoutCalibrationResult],
     pauli_repetitions: int,
     timestamp: float,
+    postselection_symmetries: dict[ops.PauliString | ops.PauliSum, int],
     disable_readout_mitigation: bool = False,
 ) -> list[PauliStringMeasurementResult]:
     """Calculates both error-mitigated expectation values and unmitigated expectation values
@@ -309,12 +377,15 @@ def _process_pauli_measurement_results(
     Returns:
         A list of PauliStringMeasurementResult.
     """
-
     pauli_measurement_results: list[PauliStringMeasurementResult] = []
 
     for pauli_group_index, circuit_result in enumerate(circuit_results):
         measurement_results = circuit_result.measurements["m"]
         pauli_strs = pauli_string_groups[pauli_group_index]
+
+        post_selection_measurement_results = _postselection_bitstrings(
+            qubits, pauli_strs, measurement_results, postselection_symmetries
+        )
 
         for pauli_str in pauli_strs:
             qubits_sorted = sorted(pauli_str.qubits)
@@ -333,7 +404,7 @@ def _process_pauli_measurement_results(
             )
 
             #  Create a mask for the relevant qubits in the measurement results
-            relevant_bits = measurement_results[:, qubit_indices]
+            relevant_bits = post_selection_measurement_results[:, qubit_indices]
 
             # Calculate the mitigated expectation.
             raw_mitigated_values, raw_d_m = tensored_cm.readout_mitigation_pauli_uncorrelated(
@@ -376,6 +447,7 @@ def measure_pauli_strings(
     pauli_repetitions: int,
     readout_repetitions: int,
     num_random_bitstrings: int,
+    postselection_symmetries: dict[ops.PauliString | ops.PauliSum, int],
     rng_or_seed: np.random.Generator | int,
 ) -> list[CircuitToPauliStringsMeasurementResult]:
     """Measures expectation values of Pauli strings on given circuits with/without
@@ -405,6 +477,8 @@ def measure_pauli_strings(
             in the shuffled benchmarking.
         num_random_bitstrings: The number of random bitstrings to use in readout
             benchmarking.
+        postselection_symmetries: A dictionary mapping Pauli strings or Pauli sums to
+            expected values for postselection symmetries.
         rng_or_seed: A random number generator or seed for the readout benchmarking.
 
     Returns:
@@ -459,6 +533,18 @@ def measure_pauli_strings(
         readout_repetitions=readout_repetitions,
     )
 
+    # # Postprocess the results to filter based on postselection symmetries
+    # if postselection_symmetries:
+    #     # Filter the circuits results based on postselection symmetries
+    #     filtered_circuits_results = []
+    #     for circuit_result in circuits_results:
+    #         if all(
+    #             np.prod(circuit_result.measurements["m"]) == value
+    #             for _, value in postselection_symmetries.items()
+    #         ):
+    #             filtered_circuits_results.append(circuit_result)
+    #     circuits_results = filtered_circuits_results
+
     # Process the results to calculate expectation values
     results: list[CircuitToPauliStringsMeasurementResult] = []
     circuit_result_index = 0
@@ -477,6 +563,7 @@ def measure_pauli_strings(
             calibration_results,
             pauli_repetitions,
             time.time(),
+            postselection_symmetries,
             disable_readout_mitigation,
         )
         results.append(
