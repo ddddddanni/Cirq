@@ -820,7 +820,28 @@ def measure_pauli_strings(
     # Split the input circuits into two lists based on the way they are measured.
     symmetry_circuits, confusion_circuits = _split_input_circuits(circuits_to_pauli_params)
 
+<<<<<<< HEAD
     return measure_pauli_strings_with_symmetries(
+=======
+    # Build the basis-change circuits for each Pauli string group
+    pauli_measurement_circuits: list[circuits.Circuit] = []
+    for input_circuit, pauli_string_groups in normalized_circuits_to_pauli.items():
+        qid_list = sorted(input_circuit.all_qubits())
+        basis_change_circuits = []
+        input_circuit_unfrozen = input_circuit.unfreeze()
+        for pauli_strings in pauli_string_groups:
+            basis_change_circuit = (
+                input_circuit_unfrozen
+                + _pauli_strings_to_basis_change_ops(pauli_strings, qid_list)
+                + ops.measure(*qid_list, key="m")
+            )
+            basis_change_circuits.append(basis_change_circuit)
+        pauli_measurement_circuits.extend(basis_change_circuits)
+
+    # Run shuffled benchmarking for readout calibration
+    circuits_results, calibration_results = run_shuffled_with_readout_benchmarking(
+        input_circuits=pauli_measurement_circuits,
+>>>>>>> f7f54e2b (Fix test flake in pauli_string_measurement_with_readout_mitigation_test (#7459))
         sampler=sampler,
         circuits_to_pauli_params=_normalize_input_symmetry_paulis(symmetry_circuits),
         pauli_measurement_circuits=_build_pauli_measurement_circuits(symmetry_circuits, True),
